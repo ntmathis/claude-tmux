@@ -1,5 +1,52 @@
 use crate::session::ClaudeCodeStatus;
 
+/// Strip ANSI escape sequences from a string.
+/// Handles CSI sequences (ESC [ ... final byte) and OSC sequences (ESC ] ... BEL or ESC \).
+fn strip_ansi_codes(s: &str) -> String {
+    let mut result = String::new();
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // Escape sequence start
+            if let Some(next) = chars.next() {
+                match next {
+                    '[' => {
+                        // CSI sequence: consume until final byte (>= 0x40)
+                        while let Some(c) = chars.next() {
+                            if c as u8 >= 0x40 {
+                                break;
+                            }
+                        }
+                    }
+                    ']' => {
+                        // OSC sequence: consume until BEL (0x07) or ESC \
+                        while let Some(c) = chars.next() {
+                            if c == '\x07' {
+                                break;
+                            } else if c == '\x1b' {
+                                // Check for ST (ESC \)
+                                if let Some(next2) = chars.next() {
+                                    if next2 == '\\' {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        // Other escape sequences (ESC followed by single char) - already consumed next, ignore
+                    }
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
 /// Detect input field: prompt line (❯) with border directly above it.
 /// Returns the index of the prompt line if found. Searches from bottom to find the
 /// most recent (current) prompt, not an old one in scrollback.
@@ -16,32 +63,79 @@ fn find_input_field_line(lines: &[&str]) -> Option<usize> {
     None
 }
 
-/// Check if a line indicates working state (interruptible)
-fn is_interrupt_line(line: &str) -> bool {
-    // Claude shows "esc to interrupt" or "ctrl+c to interrupt" when working.
-    // Just check for "interrupt" - it's only shown in working state.
-    line.contains("interrupt")
+/// Check if content contains numbered options (e.g., "1. Yes", "2) No")
+/// This indicates Claude is waiting for user input from a list of choices.
+fn has_numbered_options(lines: &[&str], start: usize, end: usize) -> bool {
+    for line in lines[start..=end].iter() {
+        // Trim whitespace and strip ANSI escape sequences
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let no_ansi = strip_ansi_codes(trimmed);
+        if no_ansi.is_empty() {
+            continue;
+        }
+
+        let mut chars = no_ansi.chars();
+        let mut has_digit = false;
+
+        while let Some(c) = chars.next() {
+            if c.is_ascii_digit() {
+                has_digit = true;
+            } else if (c == '.' || c == ')') && has_digit {
+                // After the separator, there must be non-whitespace content
+                let rest: String = chars.collect();
+                if !rest.trim_start().is_empty() {
+                    return true;
+                }
+                break;
+            } else {
+                // Not a digit and not a separator after digits; not a match
+                break;
+            }
+        }
+    }
+    false
 }
 
 pub fn detect_status(content: &str) -> ClaudeCodeStatus {
     let lines: Vec<&str> = content.lines().collect();
 
+    // Primary: look for input field with border above (proper prompt)
     if let Some(i) = find_input_field_line(&lines) {
-        // Search a window: 2 lines above, prompt, and up to 20 lines below.
-        // This works for typical desktop layouts.
         let start = i.saturating_sub(2);
         let end = std::cmp::min(i + 20, lines.len().saturating_sub(1));
+        let mut has_interrupt = false;
         for idx in start..=end {
             let line = lines[idx];
             // Match full "interrupt" or truncated "esc to…"
             if line.contains("interrupt") || line.contains("esc t") {
-                return ClaudeCodeStatus::Working;
+                has_interrupt = true;
+                break;
             }
+        }
+        if has_interrupt {
+            return ClaudeCodeStatus::Working;
+        }
+        // Check if it's a prompt with numbered choices (waiting for input)
+        if has_numbered_options(&lines, start, end) {
+            return ClaudeCodeStatus::WaitingInput;
         }
         return ClaudeCodeStatus::Idle;
     }
 
-    // No input field - check for permission prompt
+    // Fallback: detect numbered-choice prompts without a border
+    // Some prompts (like permission dialogs) may not have the typical border
+    if let Some(i) = lines.iter().rposition(|line| line.contains('❯')) {
+        let start = i.saturating_sub(2);
+        let end = std::cmp::min(i + 20, lines.len().saturating_sub(1));
+        if has_numbered_options(&lines, start, end) {
+            return ClaudeCodeStatus::WaitingInput;
+        }
+    }
+
+    // No input field - check for simple permission prompt [y/n]
     if content.contains("[y/n]") || content.contains("[Y/n]") {
         return ClaudeCodeStatus::WaitingInput;
     }
@@ -133,5 +227,47 @@ mod tests {
         // Truncated message due to narrow window: "esc to…"
         let content = "────────────────────\n❯ \n────────────────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to…";
         assert_eq!(detect_status(content), ClaudeCodeStatus::Working);
+    }
+
+    #[test]
+    fn test_waiting_input_numbered_choices() {
+        // Multiple choice prompt with numbered options
+        let content = "\nDo you want to proceed?\n─────\n❯ 1. Yes\n  2. Yes, and don't ask again for: env\n  3. No\n\nEsc to cancel · Tab to amend · ctrl+e to explain";
+        assert_eq!(detect_status(content), ClaudeCodeStatus::WaitingInput);
+    }
+
+    #[test]
+    fn test_waiting_input_numbered_choices_below_prompt() {
+        // Options appear below the prompt line
+        let content = "─────\n❯ Select action:\n1. Continue\n2. Cancel\n3. Help";
+        assert_eq!(detect_status(content), ClaudeCodeStatus::WaitingInput);
+    }
+
+    #[test]
+    fn test_waiting_input_parenthesis_numbers() {
+        // Test with closing parenthesis instead of period
+        let content = "─────\n❯ Choose:\n1) Accept\n2) Decline";
+        assert_eq!(detect_status(content), ClaudeCodeStatus::WaitingInput);
+    }
+
+    #[test]
+    fn test_waiting_input_numbered_choices_no_border() {
+        // Prompt with numbered choices but no border line - should still be detected via fallback
+        let content = "Do you want to proceed?\n❯ 1. Yes\n2. No\n3. Maybe";
+        assert_eq!(detect_status(content), ClaudeCodeStatus::WaitingInput);
+    }
+
+    #[test]
+    fn test_no_border_no_numbered_options() {
+        // Prompt line without border and without numbered choices - should remain Unknown
+        let content = "❯ ready";
+        assert_eq!(detect_status(content), ClaudeCodeStatus::Unknown);
+    }
+
+    #[test]
+    fn test_waiting_input_with_ansi_codes() {
+        // Simulate colored numbered options with ANSI escape codes
+        let content = "Do you want to proceed?\n\x1b[32m❯\x1b[0m \x1b[1;32m1.\x1b[0m Yes\n\x1b[1;32m2.\x1b[0m No\n\x1b[1;32m3.\x1b[0m Maybe";
+        assert_eq!(detect_status(content), ClaudeCodeStatus::WaitingInput);
     }
 }
